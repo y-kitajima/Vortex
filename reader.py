@@ -51,11 +51,20 @@ import requests
 # 1日あたりの秒数。「日」を「秒」に換算するのに使います。
 SECONDS_PER_DAY = 24 * 60 * 60
 
-# Discordの仕様による上限です。これを超えると投稿がエラーになるため、
+# Discordの仕様による上限です。これを超えると投稿がエラー(400)になるため、
 # 超えないように記事を「切り分け」ます。
-MAX_FIELDS_PER_EMBED = 25      # embed 1枚に入れられる項目（field）の上限
-MAX_EMBEDS_PER_MESSAGE = 10    # メッセージ1通に入れられる embed の上限
-MAX_FIELD_NAME_LENGTH = 256    # fieldのタイトル（記事名）の長さ上限
+# 【重要】Discordの制限は「個数」だけでなく「文字数」にもあります。
+#   embed 1枚の合計文字数（title + 全fieldの name + value の文字数合計）は
+#   6000文字以下でなければなりません。これは「メッセージ単位」でも同じで、
+#   1通に入れるembedの合計も6000文字以下です。
+#   個数だけで分割すると長いタイトルで容易に突破するため、
+#   「文字数を見積もりながら積み、上限に達したら次の枠へ」という作り方にしています。
+MAX_FIELDS_PER_EMBED = 25      # embed 1枚に入れられる field の個数上限
+MAX_EMBEDS_PER_MESSAGE = 10    # メッセージ1通に入れられる embed の枚数上限
+MAX_FIELD_NAME_LENGTH = 256    # field の name（記事タイトル）の文字数上限
+MAX_FIELD_VALUE_LENGTH = 1024  # field の value（URL）の文字数上限
+MAX_EMBED_CHARS = 6000         # embed 1枚・メッセージ1通の合計文字数上限
+CHAR_MARGIN = 100              # 上限ピッピで事故らないための安全マージン
 
 
 # =========================================================================
@@ -148,6 +157,37 @@ def mark_seen(conn: sqlite3.Connection, url: str) -> None:
 #
 
 
+def _make_embed(label: str, fields: list, part: int) -> dict:
+    """
+    field のリストから embed（1枚のリッチ表示）を作る。
+
+    引数:
+        label: フィード名（見出しにする）
+        fields: [{"name": ..., "value": ...}, ...] のリスト
+        part: 何枚目の「続き」か（0なら最初の枚）
+    """
+    title = f"【{label}】" if part == 0 else f"【{label}】（続き{part}）"
+    return {
+        "title": title,
+        "color": 0x00A67D,   # 16進数の色指定（緑系）。Discordの枠の色になります
+        "fields": fields,
+    }
+
+
+def _embed_chars(embed: dict) -> int:
+    """
+    embed 1枚がDiscord上で「何文字扱いされるか」の見積もりを返す。
+
+    Discordは文字数ベースで上限判定します。
+    title の文字数 + 全fieldの (name + value) の文字数の合計が、
+    そのembedのサイズ感になります（ほぼ正確な目安です）。
+    """
+    total = len(embed["title"])
+    for field in embed["fields"]:
+        total += len(field["name"]) + len(field["value"])
+    return total
+
+
 def build_embeds(new_articles: list) -> list:
     """
     新着記事リストを、Discord embed の形に変換する。
@@ -160,17 +200,15 @@ def build_embeds(new_articles: list) -> list:
     戻り値:
         Discordが要求する形式の embed（辞書）のリスト
 
-    【切り分けの理屈】
-        embed 1枚には field を25個までしか入れられません。
-        そこで同じラベルの記事を25件ずつに区切り、1区切り＝1枚のembedにします。
-        2枚目以降には「続き」という名を付けて、読み手が区別できるようにします。
+    【分割の理屈（2つの上限を両方守る）】
+        記事を1件ずつ今のembedに積みながら、次のどちらかに当たったら新しいembedへ：
+          a) field が 25個に達した場合
+          b) 次の記事を積むと合計文字数が6000（−安全マージン）を超える場合
+        同じラベルの続きには「（続きN）」と番号を付けて、読み手が区別できるようにします。
     """
     # ------------------------------------------------------------------
     # ステップ1: ラベル（フィード名）ごとに記事をまとめる
     # ------------------------------------------------------------------
-    # by_label は例えば次のような辞書になります:
-    # { "Gigazine": [記事..., 記事...], "ITmedia": [記事...] }
-    #
     # setdefault(キー, 初期値) は「キーが無ければ初期値をセットして、
     # 既にあればそのまま」。これで「ラベル → そのラベルの記事リスト」を作ります。
     by_label = {}
@@ -178,34 +216,37 @@ def build_embeds(new_articles: list) -> list:
         by_label.setdefault(article["label"], []).append(article)
 
     # ------------------------------------------------------------------
-    # ステップ2: embed の形に組み立てる（25件ごとに分割）
+    # ステップ2: 文字数を見ながら embed に積み上げる
     # ------------------------------------------------------------------
     embeds = []
     for label, items in by_label.items():
-        # range(0, 長さ, 25) → 0, 25, 50, ... と25刻みの位置を進みます。
-        # items[i:i+25] は「i番目から25個のスライス（切り出し）」です。
-        for i in range(0, len(items), MAX_FIELDS_PER_EMBED):
-            chunk = items[i:i + MAX_FIELDS_PER_EMBED]
+        fields = []          # 今積んでいるembedのfield達
+        size = len(label) + 4  # embedのタイトル【label】分の文字数を先に予約
+        part = 0             # 続き番号
 
-            # 先頭の区切り（i==0）か、続きかの2パターンでラベルを作ります。
-            # 条件付きの値入れは「分岐が小さいならこの書き方もできる」例として使っています。
-            # （読みづらければ if/else でも全く問題ありません）
-            title = f"【{label}】" if i == 0 else f"【{label}】（続き）"
+        for article in items:
+            # Discordの個別上限（name 256 / value 1024）で先に切る。
+            # [:256] は「先頭256文字で切る」スライス。空titleの保険も兼ねます。
+            name = (article["title"] or "(無題)")[:MAX_FIELD_NAME_LENGTH]
+            value = article["link"][:MAX_FIELD_VALUE_LENGTH]
 
-            embeds.append({
-                "title": title,
-                "color": 0x00A67D,   # 16進数の色指定（緑系）。Discordの枠の色になります
-                "fields": [
-                    {
-                        # [:MAX_FIELD_NAME_LENGTH] は「先頭256文字で切る」。
-                        # RSSのタイトルは通常もっと短いですが、
-                        # 長すぎるタイトルが来てもエラーにならない保険です。
-                        "name": article["title"][:MAX_FIELD_NAME_LENGTH] or "(無題)",
-                        "value": article["link"],
-                    }
-                    for article in chunk
-                ],
-            })
+            # 「今のembedが空でない」かつ「これ以上積むと上限オーバー」なら
+            # 今のembedを確定して、新しいembedを始めます。
+            if fields and (
+                len(fields) >= MAX_FIELDS_PER_EMBED
+                or size + len(name) + len(value) > MAX_EMBED_CHARS - CHAR_MARGIN
+            ):
+                embeds.append(_make_embed(label, fields, part))
+                part += 1
+                fields = []
+                size = len(label) + 4  # 新embedのタイトル分をリセット
+
+            fields.append({"name": name, "value": value})
+            size += len(name) + len(value)
+
+        # ループ終了時に残ったfield達もembedとして確定します。
+        if fields:
+            embeds.append(_make_embed(label, fields, part))
 
     return embeds
 
@@ -216,26 +257,49 @@ def send_to_discord(webhook_url: str, embeds: list) -> None:
 
     【HTTP POSTとは】
         Webサーバーに「データを送り付けて処理させる」通信の方法です。
-        GET（取りに行く）と違って、POSTは「これを受理して」と送る側が主体です。
+        サーバーは処理結果をステータスコードという数字で教えてくれます。
+        2xx = 成功（Webhookは 204 No Content）、4xx/5xx = エラー。
 
-    【戻り値のステータスコード】
-        サーバーは処理結果を数字で教えてくれます。
-        2xx = 成功、4xx/5xx = エラー。
-        Webhookの成功時は 204 No Content（「受理したよ、中身は無い」）が返ります。
+    【embedは6000文字ごとに送る】
+        embed自体は6000文字以内に収まるよう build_embeds で作られています。
+        しかし「メッセージ1通に入れるembedの合計」も6000文字以下が必要なため、
+        embedがどれくらい文字を食っているか足し算しながら、
+        詰め替え可能な枚数・文字数のどちらかを超えたら送信してリセットします。
     """
-    # embedは1メッセージにつき10枚まで。11枚以上ある場合は複数メッセージに分けます。
-    for i in range(0, len(embeds), MAX_EMBEDS_PER_MESSAGE):
-        payload = {"embeds": embeds[i:i + MAX_EMBEDS_PER_MESSAGE]}
+    message = []  # 1通にまとめるembed達をためる箱
 
-        # requests.post(url, json=...) がPOST送信本体です。
-        # json= を渡すと辞書をJSONに変換して送り、「Content-Type: application/json」も自動で付きます。
-        # timeout=20 は「20秒応答がなければエラー」という安全装置（無限待ち受け防止）。
-        resp = requests.post(webhook_url, json=payload, timeout=20)
+    for embed in embeds:
+        # 今の message に次の embed を追加できるか判定します。
+        current_chars = sum(_embed_chars(e) for e in message)
+        if message and (
+            len(message) >= MAX_EMBEDS_PER_MESSAGE
+            or current_chars + _embed_chars(embed) > MAX_EMBED_CHARS
+        ):
+            # 追加できない → 今の message を1通として送ってリセット
+            _post(webhook_url, message)
+            message = []
 
-        # raise_for_status() は、ステータスが4xx/5xxなら例外（HTTPError）を起こします。
-        # 「失敗したのに成功と勘違いする」事故を防ぐお約束の一行です。
-        # 例外が起きればこの関数はそこで停止し、main側で「送信失敗」の処理に進みます。
-        resp.raise_for_status()
+        message.append(embed)
+
+    # ループ終了後、送られていない残りがあります（0枚なら _post しません）。
+    if message:
+        _post(webhook_url, message)
+
+
+def _post(webhook_url: str, embeds: list) -> None:
+    """embedのリストを1通としてWebhookにPOSTする（送信の最下層の部品）。"""
+    payload = {"embeds": embeds}
+
+    # requests.post(url, json=...) がPOST送信本体です。
+    # json= を渡すと辞書をJSON文字列に変換して送り、
+    # 「Content-Type: application/json」というヘッダーも自動で付きます。
+    # timeout=20 は「20秒応答がなければエラー」という安全装置（無限待ち受け防止）。
+    resp = requests.post(webhook_url, json=payload, timeout=20)
+
+    # raise_for_status() は、ステータスコードが4xx/5xxなら例外（HTTPError）を起こします。
+    # 「失敗したのに成功と勘違いする」事故を防ぐお約束の一行です。
+    # 例外が起きればこの関数はそこで停止し、main側で「送信失敗」の処理に進みます。
+    resp.raise_for_status()
 
 
 # =========================================================================
