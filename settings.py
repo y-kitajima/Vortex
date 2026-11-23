@@ -34,6 +34,7 @@ def load(path: str = "config.yaml") -> dict:
         {
             "feeds": [{"label": ..., "url": ...}, ...],  ... フィード一覧
             "retention_days": 30,                         ... 既読保持日数（整数保証）
+            "window_hours": 24,                           ... 対象記事の時間窓（整数保証）
             "webhook_url": "https://...",                 ... 前後空白なしの文字列保証
         }
 
@@ -57,6 +58,7 @@ def load(path: str = "config.yaml") -> dict:
     # raw.get("キー", 既定値) は「キーが無ければ既定値を使う」取り出し方。
     # int(...) は「"30"のような文字列でも整数 30 に揃える」変換です。
     retention_days = int(raw.get("retention_days", 30))
+    window_hours = int(raw.get("window_hours", 24))
 
     # config.get("discord") が無い場合は None になる可能性があるので、
     # `or {}` で「無いなら空辞書」に正規化してから中身を取ります。
@@ -68,9 +70,10 @@ def load(path: str = "config.yaml") -> dict:
     # 「config.yaml の feeds が壊れている」という原因がすぐ分かります。
     feeds = raw["feeds"]
 
-    # 正規化 결과를まとめて返します。以降のコードはこの辞書だけを見ます。
+    # 正規化の結果をまとめて返します。以降のコードはこの辞書だけを見ます。
     return {
         "feeds": feeds,
         "retention_days": retention_days,
+        "window_hours": window_hours,
         "webhook_url": webhook_url,
     }

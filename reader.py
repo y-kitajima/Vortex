@@ -61,6 +61,15 @@ import notifier
 # 「どの例外型を拾うか」はmainが知っておく必要があるためです。
 import requests
 
+# time: 現在時刻（UNIX秒）を取得する標準モジュール。
+# 「何時間以内の記事か」の窓計算に使います。
+import time
+
+
+# --- 定数 ---
+# 1時間あたりの秒数。window_hours を秒に換算するのに使います。
+SECONDS_PER_HOUR = 60 * 60
+
 
 # =========================================================================
 # メインの処理（ここでは「誰をどの順番で呼ぶか」だけを指揮する）
@@ -72,7 +81,8 @@ def main():
     このプログラムのメイン処理。
     1. settings 経由で設定を読み込む
     2. store 経由でデータベースを開き、期間切れの既読記録を削除する
-    3. feeds 経由で各フィードから「未読の記事だけ」を取り出して表示する
+    3. feeds 経由で記事を取得し、時間窓・既読で絞り込み表示する
+       （フィードの取得失敗は止めずに warnings に回収して最後にまとめて表示）
     4. notifier 経由で新着をDiscordへ送信する
     5. 送信できた（or送信不要で表示まで完了した）記事だけを既読記録する
     """
@@ -92,7 +102,8 @@ def main():
     deleted = store.remove_old_entries(conn, cfg["retention_days"])
 
     # ---------------------------------------------------------------------
-    # 3. 各フィードから新着を取り出して表示する（feeds.py + store.py）
+    # 3. 各フィードから「期間内の未読記事だけ」を取り出して表示する
+    #    （feeds.py + store.py）
     # ---------------------------------------------------------------------
 
     print("=" * 60)
@@ -102,33 +113,58 @@ def main():
     print(f"読み込むフィード数: {len(cfg['feeds'])}件")
     print(f"既読データベース: {db_path}")
     print(f"既読の保持期間: {cfg['retention_days']}日間")
+    print(f"記事の対象窓: 過去{cfg['window_hours']}時間以内")
     print(f"期間切れの削除: {deleted}件")
     print(f"Discord配信: {'設定済み' if cfg['webhook_url'] else '未設定（コンソール表示のみ）'}")
     print("-" * 60)
     print()
 
+    # --- 時間窓の境界線（cutoff）の計算 ---
+    # cutoff = 今 − window_hours時間（秒換算）。
+    # 公開時刻がこれより前（＝古い）記事は「古すぎる」として除外します。
+    cutoff = time.time() - cfg["window_hours"] * SECONDS_PER_HOUR
+
     # 今回新着として扱った記事（Discordに送る元データ）を入れるリスト。
     # 「送信してから既読記録」をしたいので、記録は後回しにします。
     new_articles = []
+
+    # 警告を集めるリスト。
+    # 取得失敗・記事0件のフィードは全体を止めず、ここに記録して最後にまとめて出します。
+    # （外部のWebは必ず壊れるのだから「1件の失敗で大騒ぎして止まる」ほうが不便）
+    warnings = []
 
     # 表示する新着記事の数を数える変数
     total_new = 0
 
     # 各フィードを1つずつ処理します
     for feed in cfg["feeds"]:
-        # RSS取得と正規化は feeds.py に任せます。
-        # ここでは「label/title/link を持つ辞書のリスト」が返ってくることだけ相信します。
-        articles = feeds.fetch_feed(feed["label"], feed["url"])
+        # 取得と正規化は feeds.py に任けます。
+        # 戻り値は (記事リスト, 警告 or None) のタプルです。失敗時は記事リストは空。
+        articles, warning = feeds.fetch_feed(feed["label"], feed["url"])
+
+        # 警告があれば回収する（すぐ表示しないのは、まず全体の流れを読みたいから）
+        if warning:
+            warnings.append(warning)
 
         label = feed["label"]
         print(f"【{label}】")
 
         fetched = len(articles)
         new_count = 0
+        too_old_count = 0
 
         # 各記事を1件ずつチェック
         for article in articles:
-            # すでに既読なら表示をスキップする（store.py に聞く）
+            # --- フィルタ1: 公開時刻の時間窓 ---
+            # published は UNIX秒 or None（RSSに日付が無い場合）。
+            # None は「新しめ」として通過させます。
+            # 理由: 日付が無表示のフィード（Google News系など）は
+            #       フィード自体が「最近の一覧」なので、除外すると不当にこぼします。
+            if article["published"] is not None and article["published"] < cutoff:
+                too_old_count += 1
+                continue
+
+            # --- フィルタ2: 既読なら表示をスキップする（store.py に聞く） ---
             if store.is_seen(conn, article["link"]):
                 continue
 
@@ -143,8 +179,21 @@ def main():
             new_articles.append(article)
 
         # --- このフィードの集計を表示 ---
-        skipped = fetched - new_count
-        print(f"  → 取得{fetched}件 / 新着{new_count}件 / 既読スキップ{skipped}件")
+        # 残りは既読スキップ。「取得 = 新着 + 窓外 + 既読」なので後ろから2つ引く
+        seen_skipped = fetched - new_count - too_old_count
+        print(
+            f"  → 取得{fetched}件 / 新着{new_count}件 / "
+            f"窓外{too_old_count}件 / 既読スキップ{seen_skipped}件"
+        )
+        print()
+        print("-" * 60)
+        print()
+
+    # --- 回収した警告をまとめて表示 ---
+    if warnings:
+        print(f"注意したソース {len(warnings)}件:")
+        for w in warnings:
+            print("  -", w)
         print()
         print("-" * 60)
         print()
