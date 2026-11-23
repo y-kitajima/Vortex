@@ -4,32 +4,38 @@
 #
 # 【このファイルの責務】
 #   1. RSSフィードをHTTPで取得する（失敗しても例外を投げず警告を返す）
-#   2. 外部データ（RSS）のバラバラな形を、このアプリ共通の辞書に変換する（正規化）
+#   2. 外部データ（RSS）のバラバラな形を、models.Article の箱に変換する（正規化）
 #
-# 【記事の共通形】
-#   このアプリの中で記事は、次のキーを持つ辞書としてやり取りします:
-#       {"label": "Gigazine", "title": "...", "link": "https://...",
-#        "published": 1763942400.0}   # 公開時刻のUNIX秒（不明なら None）
-#   feeds.py の外では、この形だけを信じれば良くなります。
+# 【今回の変化: dict → dataclass】
+#   これまで記事は {"title": ..., "link": ...} のdictで返していました。
+#   これからは models.Article として返します。呼び出し側は
+#   article.title / article.link と「属性名」で取り出します。
+#   キーの打ち間違いが構造的に起きなくなり、
+#   「Articleには何が入っているか」が models.py 一読で分かります。
 #
-# 【失敗に強い設計（今回のメインの学習ポイント）】
+# 【失敗に強い設計】
 #   外部のWebは必ず壊れます（サイト障害・URL変更・アクセス拒否403…）。
 #   1つのURLの失敗でアプリ全体が落ちると「お気に入りサイトが1つ落ちた日」に
 #   他の新着も全部取れなくなってしまいます。
 #   そこで fetch_feed は失敗しても例外を外に投げず、
 #   (記事のリスト, 警告メッセージ) のタプルで結果を返します。
-#   呼び出し側（reader.py）は警告を後でまとめて表示します。
 #
 # =============================================================================
 
 # calendar: 日付の構造体を「UNIX秒」に変換する標準モジュール
 import calendar
 
+# urlparse: URLを部品（プロトコル・ドメイン・パス）に分解する標準モジュール
+from urllib.parse import urlparse
+
 # feedparser: RSSフィード（XML形式のデータ）を解析する外部ライブラリ
 import feedparser
 
 # requests: HTTPリクエストを送る外部ライブラリ
 import requests
+
+# models: このアプリ共通のデータの箱（Topic / Article）の定義
+import models
 
 
 def _to_epoch(entry) -> float | None:
@@ -54,17 +60,17 @@ def _to_epoch(entry) -> float | None:
     return calendar.timegm(dt) if dt else None
 
 
-def fetch_feed(label: str, url: str) -> tuple[list, str | None]:
+def fetch_feed(topic: models.Topic, url: str) -> tuple[list, str | None]:
     """
-    1つのRSSフィードを取得し、記事リストに正規化して返す。
+    1つのRSSフィードを取得し、Article のリストに正規化して返す。
 
     引数:
-        label: フィードの表示名（例: "Gigazine"）。記事に焼き付けて返す
+        topic: このフィードが所属する Topic（情報源ではなく「まとめ先」の情報）
         url:   RSSフィードのURL
     戻り値:
         (articles, warning) のタプル
-            articles: 記事辞書のリスト（失敗時は空リスト []）
-            warning : 失敗・异常時の警告文字列。正常時は None
+            articles: Article のリスト（失敗時は空リスト []）
+            warning : 失敗・異常時の警告文字列。正常時は None
 
     【なぜ feedparser.parse(url) ではなく requests で取得するのか】
         feedparser はURLを直接渡されると、HTTPが失敗しても例外を投げず
@@ -89,9 +95,14 @@ def fetch_feed(label: str, url: str) -> tuple[list, str | None]:
         return [], f"取得失敗({type(e).__name__}): {url}"
 
     # ------------------------------------------------------------------
-    # 2. XML解析と正規化
+    # 2. XML解析と正規化（RSSのentry → Article の箱）
     # ------------------------------------------------------------------
     parsed = feedparser.parse(resp.content)
+
+    # URLからドメイン（例: https://a.b/c → "a.b"）を取り出しておきます。
+    # 同じトピックに複数サイトが混ざったとき「どこのサイトの記事か」の
+    # 目印として Article.source に入れます。
+    host = urlparse(url).netloc
 
     articles = []
     for entry in parsed.entries:
@@ -107,14 +118,18 @@ def fetch_feed(label: str, url: str) -> tuple[list, str | None]:
         if not link:
             continue
 
-        articles.append({
-            "label": label,
-            "title": title,
-            "link": link,
-            "published": _to_epoch(entry),
-        })
+        # Article 箱に詰める。ここで一度「型」に通すので、
+        # 必須項目の欠落はここで気づけます（dataclassの利点）。
+        articles.append(models.Article(
+            topic_key=topic.key,
+            topic_label=topic.label,
+            title=title,
+            link=link,
+            source=host,
+            published=_to_epoch(entry),
+        ))
 
-    # 取得はできたのに記事が1件も無い場合も、設定ミスの线索として警告にします。
+    # 取得はできたのに記事が1件も無い場合も、設定ミスの手がかりとして警告にします。
     if not articles:
         return [], f"記事なし: {url}"
 

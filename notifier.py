@@ -85,10 +85,15 @@ def build_embeds(new_articles: list) -> list:
     新着記事リストを、Discord embed の形に変換する。
 
     引数:
-        new_articles: [{"label": ..., "title": ..., "link": ...}, ...]
-                      （feeds.py が正規化した形）
+        new_articles: models.Article のリスト
+                      （feeds.py が正規化したdataclassの箱）
     戻り値:
         Discordが要求する形式の embed（辞書）のリスト
+
+    【dataclass化で変わったこと】
+        dictのとき: article["title"]（キー名を毎回書く／打ち間違い無警告）
+        Articleとき: article.title  （エディタ補完が効く／打ち間違いは即エラー）
+        見出しのグループ化は「トピック表示名」でまとめます。
 
     【分割の理屈（2つの上限を両方守る）】
         記事を1件ずつ今のembedに積みながら、どちらかに当たったら新しいembedへ:
@@ -96,13 +101,13 @@ def build_embeds(new_articles: list) -> list:
           b) 次の記事を積むと合計文字数が6000（−安全マージン）を超える場合
     """
     # ------------------------------------------------------------------
-    # ステップ1: ラベル（フィード名）ごとに記事をまとめる
+    # ステップ1: トピック表示名ごとに記事をまとめる
     # ------------------------------------------------------------------
     # setdefault(キー, 初期値) は「キーが無ければ初期値をセットして、
-    # 既にあればそのまま」。これで「ラベル → そのラベルの記事リスト」を作ります。
+    # 既にあればそのまま」。これで「トピック → そのトピックの記事リスト」を作ります。
     by_label = {}
     for article in new_articles:
-        by_label.setdefault(article["label"], []).append(article)
+        by_label.setdefault(article.topic_label, []).append(article)
 
     # ------------------------------------------------------------------
     # ステップ2: 文字数を見ながら embed に積み上げる
@@ -115,8 +120,11 @@ def build_embeds(new_articles: list) -> list:
 
         for article in items:
             # Discordの個別上限（name 256 / value 1024）で先に切る。
-            name = (article["title"] or "(無題)")[:MAX_FIELD_NAME_LENGTH]
-            value = article["link"][:MAX_FIELD_VALUE_LENGTH]
+            # nameは「出典ドメイン: タイトル」の形にすると、同じトピックに
+            # 複数サイトが混ざったとき見分けやすいです。
+            title = article.title or "(無題)"
+            name = f"{article.source}: {title}"[:MAX_FIELD_NAME_LENGTH]
+            value = article.link[:MAX_FIELD_VALUE_LENGTH]
 
             # 「今のembedが空でない」かつ「これ以上積むと上限オーバー」なら
             # 今のembedを確定して、新しいembedを始めます。

@@ -3,9 +3,9 @@
 # =============================================================================
 #
 # このプログラムの目的:
-#   1. config.yaml のRSSフィードから記事を集める
-#   2. 既読（前回までに表示済み）の記事をスキップする
-#   3. 新着記事を Discord に embed（リッチな枠）で送信する
+#   1. config.yaml のトピック（RSSのまとめ先）ごとに記事を集める
+#   2. 時間窓（window_hours）と既読（seen.db）で絞り込む
+#   3. 公開日が新しい順に max_items_per_topic 件まで Discord へ送信する
 #   4. 「送信に成功した記事だけ」を既読として記録する
 #
 # 使い方:
@@ -13,18 +13,13 @@
 #   2. config.yaml を編集（webhook_url は空でも動く＝コンソール表示のみ）
 #   3. py reader.py
 #
-# 【プロジェクトの構成（分割後）】
+# 【プロジェクトの構成】
 #   reader.py   ... 全体の流れの指揮だけ（このファイル）
-#   settings.py ... config.yaml を読む・正規化する
+#   models.py   ... データの箱の定義（Topic / Article）
+#   settings.py ... config.yaml を読み、箱に詰め替える
 #   store.py    ... 既読データベース（seen.db）の読み書き
-#   feeds.py    ... RSS取得と記事の正規化
+#   feeds.py    ... RSS取得と記事の正規化（Article箱に変換）
 #   notifier.py ... Discord embed の組み立てと送信
-#
-#   分割の原則は「変更する理由が同じものは同じファイル」。
-#   RSSの取得方法を変えたくなったら feeds.py だけ、
-#   Discordの仕様が変わったら notifier.py だけ を直せば済みます。
-#   reader.py は各担当を「順番に呼ぶ指揮者」なので、
-#   アプリの全体像は常にこのファイルを読めば分かります。
 #
 #   ※実行すると __pycache__ というフォルダが作されます。
 #   Pythonが import の結果を高速化用にキャッシュする仕組みで、
@@ -35,30 +30,19 @@
 #   その記事は「二度とどこにも出ない」まま消えてしまいます。
 #   そこで順番を「送信成功 → その後で既読記録」にします。
 #   失敗した場合は既読にならないので、次回の実行で再挑戦されます。
-#   （この考え方を「少なくとも1回届ける（at-least-once）」と呼ぶことがあります）
+#   （上限件数で切り捨てられた記事も同じ理屈で「未読のまま」です。
+#     次回も窓内なら再挑戦、窓を過ぎれば自然と消えます）
 #
 # =============================================================================
 
 # --- 自分のファイルたち（モジュール）の読み込み ---
 # pipは不要です。同じフォルダの .py ファイルは名前だけで import できます。
-# 「settingsのloadを呼ぶ」→ settings.load() という読み方になります。
 import settings
-
-# 「storeのopen_dbを呼ぶ」→ store.open_db()
 import store
-
-# feeds.py の fetch_feed（RSS取得）を使います。
-# （config.yaml の "feeds" というキー名と名前が被りますが、
-#   モジュールとしての feeds と辞書のキーは別物なので問題ありません）
 import feeds
-
-# Discordへの組み立て・送信は notifier が担当です。
-# notifier_build_embeds という長い名を避けて、
-# 「notifier.build_embeds()」とドット付きで呼ぶ方式にしています。
 import notifier
 
 # requests: 送信失敗（例外）を受け止めるために、main側でも import します。
-# 「どの例外型を拾うか」はmainが知っておく必要があるためです。
 import requests
 
 # time: 現在時刻（UNIX秒）を取得する標準モジュール。
@@ -79,9 +63,10 @@ SECONDS_PER_HOUR = 60 * 60
 def main():
     """
     このプログラムのメイン処理。
-    1. settings 経由で設定を読み込む
+    1. settings 経由で設定（Topicのリスト等）を読み込む
     2. store 経由でデータベースを開き、期間切れの既読記録を削除する
-    3. feeds 経由で記事を取得し、時間窓・既読で絞り込み表示する
+    3. トピックごとに feeds 経由で記事を取得し、
+       窓フィルタ→既読フィルタ→新しい順ソート→上限カットする
        （フィードの取得失敗は止めずに warnings に回収して最後にまとめて表示）
     4. notifier 経由で新着をDiscordへ送信する
     5. 送信できた（or送信不要で表示まで完了した）記事だけを既読記録する
@@ -90,8 +75,6 @@ def main():
     # ---------------------------------------------------------------------
     # 1. 設定を読み込む（settings.py の担当）
     # ---------------------------------------------------------------------
-    # load() が返す辞書は形が保証されています:
-    # { "feeds": [...], "retention_days": 30, "webhook_url": "https://..." }
     cfg = settings.load()
 
     # ---------------------------------------------------------------------
@@ -102,18 +85,18 @@ def main():
     deleted = store.remove_old_entries(conn, cfg["retention_days"])
 
     # ---------------------------------------------------------------------
-    # 3. 各フィードから「期間内の未読記事だけ」を取り出して表示する
-    #    （feeds.py + store.py）
+    # 3. トピックごとに集めて・絞って・表示する
     # ---------------------------------------------------------------------
 
     print("=" * 60)
-    print("  RSSリーダー（既読管理 + Discord配信）")
+    print("  RSSリーダー（トピック配信版）")
     print("=" * 60)
     print()
-    print(f"読み込むフィード数: {len(cfg['feeds'])}件")
+    print(f"トピック数: {len(cfg['topics'])}件")
     print(f"既読データベース: {db_path}")
     print(f"既読の保持期間: {cfg['retention_days']}日間")
     print(f"記事の対象窓: 過去{cfg['window_hours']}時間以内")
+    print(f"1トピック上限: {cfg['max_items_per_topic']}件")
     print(f"期間切れの削除: {deleted}件")
     print(f"Discord配信: {'設定済み' if cfg['webhook_url'] else '未設定（コンソール表示のみ）'}")
     print("-" * 60)
@@ -122,72 +105,93 @@ def main():
     # --- 時間窓の境界線（cutoff）の計算 ---
     # cutoff = 今 − window_hours時間（秒換算）。
     # 公開時刻がこれより前（＝古い）記事は「古すぎる」として除外します。
-    cutoff = time.time() - cfg["window_hours"] * SECONDS_PER_HOUR
+    now = time.time()
+    cutoff = now - cfg["window_hours"] * SECONDS_PER_HOUR
 
-    # 今回新着として扱った記事（Discordに送る元データ）を入れるリスト。
+    # 今回「送信候補」と確定した記事（上限カット後のArticle達）を入れるリスト。
     # 「送信してから既読記録」をしたいので、記録は後回しにします。
     new_articles = []
 
     # 警告を集めるリスト。
     # 取得失敗・記事0件のフィードは全体を止めず、ここに記録して最後にまとめて出します。
-    # （外部のWebは必ず壊れるのだから「1件の失敗で大騒ぎして止まる」ほうが不便）
     warnings = []
 
-    # 表示する新着記事の数を数える変数
-    total_new = 0
+    # 各トピックを1つずつ処理します（topic は settings が作ってくれた Topic 箱）
+    for topic in cfg["topics"]:
+        print(f"【{topic.label}】")
 
-    # 各フィードを1つずつ処理します
-    for feed in cfg["feeds"]:
-        # 取得と正規化は feeds.py に任けます。
-        # 戻り値は (記事リスト, 警告 or None) のタプルです。失敗時は記事リストは空。
-        articles, warning = feeds.fetch_feed(feed["label"], feed["url"])
+        fetched = 0        # このトピックで取得した記事の総数
+        too_old = 0        # 時間窓より古かった数
+        fresh = []         # 窓内で未読の記事（まだ上限は適用前）
 
-        # 警告があれば回収する（すぐ表示しないのは、まず全体の流れを読みたいから）
-        if warning:
-            warnings.append(warning)
+        # トピックに紐づく全フィードを回す
+        for url in topic.feeds:
+            # 取得と正規化は feeds.py に任せます。
+            # 戻り値は (Articleリスト, 警告 or None) のタプルです。
+            articles, warning = feeds.fetch_feed(topic, url)
+            if warning:
+                warnings.append(warning)
 
-        label = feed["label"]
-        print(f"【{label}】")
+            fetched += len(articles)
 
-        fetched = len(articles)
-        new_count = 0
-        too_old_count = 0
+            for article in articles:
+                # --- フィルタ1: 公開時刻の時間窓 ---
+                # published は UNIX秒 or None（RSSに日付が無い場合）。
+                # None は「新しめ」として通過させます。
+                if article.published is not None and article.published < cutoff:
+                    too_old += 1
+                    continue
 
-        # 各記事を1件ずつチェック
-        for article in articles:
-            # --- フィルタ1: 公開時刻の時間窓 ---
-            # published は UNIX秒 or None（RSSに日付が無い場合）。
-            # None は「新しめ」として通過させます。
-            # 理由: 日付が無表示のフィード（Google News系など）は
-            #       フィード自体が「最近の一覧」なので、除外すると不当にこぼします。
-            if article["published"] is not None and article["published"] < cutoff:
-                too_old_count += 1
-                continue
+                # --- フィルタ2: 既読ならスキップする（store.py に聞く） ---
+                if store.is_seen(conn, article.link):
+                    continue
 
-            # --- フィルタ2: 既読なら表示をスキップする（store.py に聞く） ---
-            if store.is_seen(conn, article["link"]):
-                continue
+                fresh.append(article)
 
-            # --- 新着記事として表示 & 送信リストに追加（まだ既読化しない） ---
-            new_count += 1
-            total_new += 1
-            print(f"  {new_count}. {article['title']}")
-            print(f"     {article['link']}")
+        # --- フィルタ3: 公開日が新しい順に並べて上限件数で切る ---
+        #
+        # 【sort(key=..., reverse=True) の読み方】
+        #   「何を目安に並べるか」を key に渡します。
+        #   ここでは各 Article から published（公開時刻）を取り出して比較します。
+        #
+        # 【lambda（ラムダ式）とは】
+        #   「1行で書ける小さい関数」です。
+        #   lambda a: a.published は「aを渡されたらa.publishedを返す」関数で、
+        #   def で名前付き関数を作るほどでもない短い処理に向いています。
+        #
+        # 【日付無し（None）記事の扱い】
+        #   published が None の記事には now（今）を代入して「最新の仲間」として
+        #   先頭側に並べます。None のまま比較すると float と比較できず
+        #   TypeError になるので、必ず数字に置き換えてから扱います。
+        #   （これは分岐演算子で「もし〜ならA、そうでなければB」を表しています）
+        fresh.sort(
+            key=lambda a: a.published if a.published is not None else now,
+            reverse=True,  # True = 降順（大きい＝新しいが先頭）
+        )
+
+        # [:N] は「先頭からN件」のスライス。上限件数で切ります。
+        top = fresh[:cfg["max_items_per_topic"]]
+        dropped = len(fresh) - len(top)   # 上限で切り捨てた数（次回も窓内なら再挑戦）
+
+        # --- 送信候補として表示（まだ既読化しない） ---
+        for i, article in enumerate(top, start=1):
+            new_articles.append(article)
+            print(f"  {i}. {article.source}: {article.title}")
+            print(f"     {article.link}")
             print()
 
-            # 送信まで完了したら既読化する分として保持しておく
-            new_articles.append(article)
-
-        # --- このフィードの集計を表示 ---
-        # 残りは既読スキップ。「取得 = 新着 + 窓外 + 既読」なので後ろから2つ引く
-        seen_skipped = fetched - new_count - too_old_count
+        # --- このトピックの集計を表示 ---
+        # 残りは既読スキップ。「取得 = 窓外 + 既読 + 新着候補」なので逆算します。
+        seen_skipped = fetched - too_old - len(fresh)
         print(
-            f"  → 取得{fetched}件 / 新着{new_count}件 / "
-            f"窓外{too_old_count}件 / 既読スキップ{seen_skipped}件"
+            f"  → 取得{fetched}件 / 新着{len(top)}件 / 窓外{too_old}件 / "
+            f"既読スキップ{seen_skipped}件 / 上限カット{dropped}件"
         )
         print()
         print("-" * 60)
         print()
+
+    total_new = len(new_articles)
 
     # --- 回収した警告をまとめて表示 ---
     if warnings:
@@ -234,7 +238,7 @@ def main():
 
     if can_mark_read:
         for article in new_articles:
-            store.mark_seen(conn, article["link"])
+            store.mark_seen(conn, article.link)
 
     # メモリ上のデータをファイルに書き出します（commit忘れると記録が消える）
     conn.commit()
