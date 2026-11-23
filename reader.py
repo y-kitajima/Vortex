@@ -13,13 +13,15 @@
 #   2. このファイルを実行します:
 #      py reader.py
 #
-#   3. 1回目は記事が表示され、続けて2回目を执行すると「新着0件」になるはずです。
+#   3. 1回目は記事が表示され、続けて2回目を 実行すると「新着0件」になるはずです。
 #      これが既読管理が動いている証拠です。
 #
 # 仕組みの概要:
-#   - seen.db というファイルに「既に出した記事のURL」を記録していく
+#   - seen.db というファイルに「既に出した記事のURL」と「記録した日時」を保存する
 #   - 記事を表示する前に「このURLは記録済みか？」を照会する
 #   - 表示した記事のURLは必ず記録する
+#   - 毎回の起動時に、保持期間（retention_days）より古い記録を自動削除する。
+#     これがないと記録が無限に積み上がり、DBが肥大し続けます。
 #   - seen.db を削除すれば「全部未読」に戻せる（リセット方法）
 #
 # =============================================================================
@@ -30,11 +32,21 @@
 # pipでのインストールは不要です。1つのファイルがそのままデータベースになります。
 import sqlite3
 
+# time: 現在時刻を取得する標準モジュール。ここでは「記録した瞬間の時刻」を
+# 数字（UNIX秒）として保存するために使います。
+import time
+
 # feedparser: RSSフィード（XML形式のデータ）を読み込むライブラリ
 import feedparser
 
 # yaml: YAML形式の設定ファイルを読み込むライブラリ
 import yaml
+
+
+# --- 定数の定義 ---
+# 1日あたりの秒数。「日」を「秒」に換算するのに使います。
+# 24時間 × 60分 × 60秒 = 86400 秒
+SECONDS_PER_DAY = 24 * 60 * 60
 
 
 # =========================================================================
@@ -63,6 +75,22 @@ def open_db(db_path: str) -> sqlite3.Connection:
     """
     conn = sqlite3.connect(db_path)
 
+    # 【マイグレーション（古い表の引っ越し）】
+    # 前のバージョンのこのプログラムは seen テーブルに url 列しか持っていませんでした。
+    # 新しいバージョンは seen_at（記録日時）列も必要とします。
+    # SQLiteでは「テーブルの形」は作成時に決まるので、古いDBをそのまま使うと
+    # 列が無くてエラーになります。
+    # そこで「表が存在する かつ seen_at列が無い」なら作り直す、という確認をしています。
+    # （本番のサービスならデータを捨てず列を足す方法を取りますが、
+    #   学習用の個人アプリでは「履歴は再取得可能」なので作り直しで十分です）
+    #
+    # PRAGMA table_info(seen) ... SQLiteに「seenテーブルの列一覧」を聞く命令
+    # 各行の2番目の要素（row[1]）が列名です。
+    columns = [row[1] for row in conn.execute("PRAGMA table_info(seen)").fetchall()]
+    if columns and "seen_at" not in columns:
+        # DROP TABLE = 表をまるごと削除。以下の CREATE で作り直されます。
+        conn.execute("DROP TABLE seen")
+
     # テーブルを作る命令（SQL文）を実行します。
     #
     # 【テーブルとは】
@@ -78,14 +106,51 @@ def open_db(db_path: str) -> sqlite3.Connection:
     #                                       TEXT = 文字列の型。
     #                                       PRIMARY KEY = この列の値は重複不可という約束。
     #                                       これにより同じURLが2回記録されることはありません。
+    #     seen_at REAL NOT NULL           ... 「記録した日時」を入れる列。
+    #                                       REAL = 小数を含む数字の型。
+    #                                       UNIX秒（1970年1月1日からの経過秒数）で保存します。
+    #                                       NOT NULL = 必ず値を入れる制約。
+    #                                       日付を「数字」で持つと、後で
+    #                                       「◯秒より古い」といった比較が簡単にできます。
     #   )
     conn.execute("""
         CREATE TABLE IF NOT EXISTS seen (
-            url TEXT PRIMARY KEY
+            url TEXT PRIMARY KEY,
+            seen_at REAL NOT NULL
         )
     """)
 
     return conn
+
+
+def remove_old_entries(conn: sqlite3.Connection, retention_days: int) -> int:
+    """
+    保持期間より古い既読記録を削除する（データベースの肥大化防止）。
+
+    引数:
+        conn: データベースのコネクション
+        retention_days: 記録を保持する日数（例: 30 なら30日前までの記録だけ残す）
+    戻り値:
+        削除した行数
+
+    【考え方】
+        「seen_at（記録時刻）が、N秒以上前レコードは消す」という理屈です。
+        cutoff（境界線）= 今の時刻 − 保持日数分の秒数
+        これより小さい seen_at = 「古い」ので削除対象。
+    """
+    # time.time() は「今この瞬間」をUNIX秒（float）で返してくれます。
+    # UNIX秒とは「1970年1月1日0時（UTC）から数えた秒数」という世界共通の日付表現です。
+    # 数字なので、引き算や大小比較ができるのが利点です。
+    cutoff = time.time() - retention_days * SECONDS_PER_DAY
+
+    # 【DELETEとは】
+    #   テーブルから行を削除する命令です。
+    #   WHERE seen_at < ? → 「seen_atが境界線より古い（＝小さい＝過去）」が条件。
+    cur = conn.execute("DELETE FROM seen WHERE seen_at < ?", (cutoff,))
+
+    # cur.rowcount = このDELETEで実際に何行消えたかの数。
+    # メイン側に報告して画面表示するため、ここに戻り値として渡します。
+    return cur.rowcount
 
 
 def is_seen(conn: sqlite3.Connection, url: str) -> bool:
@@ -114,7 +179,7 @@ def is_seen(conn: sqlite3.Connection, url: str) -> bool:
 
 def mark_seen(conn: sqlite3.Connection, url: str) -> None:
     """
-    このURLを「既読」としてデータベースに記録する。
+    このURLを「いつ既読にしたか」という日時付きでデータベースに記録する。
 
     引数:
         conn: データベースのコネクション
@@ -125,7 +190,13 @@ def mark_seen(conn: sqlite3.Connection, url: str) -> None:
     """
     # INSERT OR IGNORE の "OR IGNORE" は「重複したら黙って無視してね」という意味。
     # PRIMARY KEY の制約（重複不可）と組み合わせて、安全に記録します。
-    conn.execute("INSERT OR IGNORE INTO seen (url) VALUES (?)", (url,))
+    # VALUES (?, ?) の2つ目の ? には「今この瞬間」のUNIX秒を入れます。
+    # これにより「いつ出したか」が記録され、remove_old_entries で
+    # 「古い記録を消す」判断の基準になります。
+    conn.execute(
+        "INSERT OR IGNORE INTO seen (url, seen_at) VALUES (?, ?)",
+        (url, time.time()),
+    )
 
 
 def save_changes(conn: sqlite3.Connection) -> None:
@@ -149,7 +220,7 @@ def main():
     """
     このプログラムのメイン処理。
     1. 設定ファイルを読み込む
-    2. データベースを開く
+    2. データベースを開き、期間切れの既読記録を削除する
     3. 各フィードから「未読の記事だけ」を取り出して表示し、既読として記録する
     4. 変更を確定してデータベースを閉じる
     """
@@ -166,6 +237,7 @@ def main():
 
     # config は以下のような辞書になっています:
     # {
+    #     "retention_days": 30,
     #     "feeds": [
     #         {"label": "Gigazine", "url": "https://..."},
     #         ...
@@ -173,12 +245,22 @@ def main():
     # }
     feeds = config["feeds"]
 
+    # dict.get("キー", 既定値) は「キーが無ければ既定値を使う」取り出し方です。
+    # config.yaml に retention_days を書かなかった場合でも動くように、
+    # 30日をデフォルトにしておきます。
+    # int(...) は「文字列の"30"を整数の30にする」変換です。
+    retention_days = int(config.get("retention_days", 30))
+
     # ---------------------------------------------------------------------
-    # 2. データベースを開く
+    # 2. データベースを開き、古い既読記録を掃除する
     # ---------------------------------------------------------------------
 
     db_path = "seen.db"
     conn = open_db(db_path)
+
+    # 保持期間より古い記録を削除します。
+    # 毎回の起動時にやるのがポイント（放置すると無限に貯まり続けます）。
+    deleted = remove_old_entries(conn, retention_days)
 
     # ---------------------------------------------------------------------
     # 3. 見出しを表示
@@ -190,6 +272,8 @@ def main():
     print()
     print(f"読み込むフィード数: {len(feeds)}件")
     print(f"既読データベース: {db_path}")
+    print(f"既読の保持期間: {retention_days}日間")
+    print(f"期間切れの削除: {deleted}件")
     print("-" * 60)
     print()
 
@@ -221,7 +305,7 @@ def main():
             if not link:
                 continue
 
-            # ここが Step 3 の中心部分です:
+            # ここが中心部分です:
             # 「すでに既読なら表示をスキップする」
             if is_seen(conn, link):
                 continue
