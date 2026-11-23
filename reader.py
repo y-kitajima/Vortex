@@ -1,39 +1,38 @@
 # =============================================================================
-# RSSリーダー（既読管理つき）
+# RSSリーダー（既読管理 + Discord配信つき）
 # =============================================================================
 #
 # このプログラムの目的:
-#   一度表示した記事を覚えておき（既読管理）、次回の実行では
-#   「まだ見ていない新着記事だけ」を表示する
+#   1. config.yaml のRSSフィードから記事を集める
+#   2. 既読（前回までに表示済み）の記事をスキップする
+#   3. 新着記事を Discord に embed（リッチな枠）で送信する
+#   4. 「送信に成功した記事だけ」を既読として記録する
 #
 # 使い方:
 #   1. 必要なライブラリをインストールします:
 #      py -m pip install -r requirements.txt
 #
-#   2. このファイルを実行します:
+#   2. config.yaml の discord.webhook_url にURLを貼ります
+#      （空のままなら Discord には送らず、コンソール表示だけで動きます）
+#
+#   3. このファイルを実行します:
 #      py reader.py
 #
-#   3. 1回目は記事が表示され、続けて2回目を 実行すると「新着0件」になるはずです。
-#      これが既読管理が動いている証拠です。
-#
-# 仕組みの概要:
-#   - seen.db というファイルに「既に出した記事のURL」と「記録した日時」を保存する
-#   - 記事を表示する前に「このURLは記録済みか？」を照会する
-#   - 表示した記事のURLは必ず記録する
-#   - 毎回の起動時に、保持期間（retention_days）より古い記録を自動削除する。
-#     これがないと記録が無限に積み上がり、DBが肥大し続けます。
-#   - seen.db を削除すれば「全部未読」に戻せる（リセット方法）
+# 【なぜ「送信してから既読記録」なのか】
+#   表示した瞬間に既読登録してしまうと、その後のDiscord送信が失敗したときに
+#   その記事は「二度とどこにも出ない」まま消えてしまいます。
+#   そこで順番を「送信成功 → その後で既読記録」にします。
+#   失敗した場合は既読にならないので、次回の実行で再挑戦されます。
+#   （この考え方を「少なくとも1回届ける（at-least-once）」と呼ぶことがあります）
 #
 # =============================================================================
 
 # --- 外部ライブラリ・標準モジュールの読み込み ---
 
-# sqlite3: SQLiteデータベースを扱うモジュール。Pythonに標準で付属しているので
-# pipでのインストールは不要です。1つのファイルがそのままデータベースになります。
+# sqlite3: SQLiteデータベースを扱うモジュール。Pythonに標準で付属しています。
 import sqlite3
 
-# time: 現在時刻を取得する標準モジュール。ここでは「記録した瞬間の時刻」を
-# 数字（UNIX秒）として保存するために使います。
+# time: 現在時刻を取得する標準モジュール。「記録した瞬間」をUNIX秒で保存するために使います。
 import time
 
 # feedparser: RSSフィード（XML形式のデータ）を読み込むライブラリ
@@ -42,77 +41,49 @@ import feedparser
 # yaml: YAML形式の設定ファイルを読み込むライブラリ
 import yaml
 
+# requests: WebにHTTPリクエストを送るライブラリ。
+# ここでは「DiscordのWebhook URLにPOSTする」ために使います。
+import requests
+
 
 # --- 定数の定義 ---
+
 # 1日あたりの秒数。「日」を「秒」に換算するのに使います。
-# 24時間 × 60分 × 60秒 = 86400 秒
 SECONDS_PER_DAY = 24 * 60 * 60
 
+# Discordの仕様による上限です。これを超えると投稿がエラーになるため、
+# 超えないように記事を「切り分け」ます。
+MAX_FIELDS_PER_EMBED = 25      # embed 1枚に入れられる項目（field）の上限
+MAX_EMBEDS_PER_MESSAGE = 10    # メッセージ1通に入れられる embed の上限
+MAX_FIELD_NAME_LENGTH = 256    # fieldのタイトル（記事名）の長さ上限
+
 
 # =========================================================================
-# ここから下は「データベースを操作するための部品（関数）」です
+# データベースを操作するための部品（関数）
 # =========================================================================
-#
-# 関数とは「ある処理をまとめて名前を付けたもの」です。
-# main() の中で何度も同じ処理を書くより、部品として切り出したほうが
-# 読みやすく、間違いも少なくなります。
-#
 
 
 def open_db(db_path: str) -> sqlite3.Connection:
     """
     データベースを開き、必要なテーブルが無ければ作る。
 
-    引数:
-        db_path: データベースファイルのパス（例: "seen.db"）
-    戻り値:
-        開いたデータベースへの「コネクション」という接続オブジェクト
-
     コネクションとは:
         データベースとの「回線」のようなものです。この回線を通して
         SQL文という命令を送り、結果を受け取ります。
-        ファイルが無ければ新規に作成されます。
     """
     conn = sqlite3.connect(db_path)
 
     # 【マイグレーション（古い表の引っ越し）】
-    # 前のバージョンのこのプログラムは seen テーブルに url 列しか持っていませんでした。
-    # 新しいバージョンは seen_at（記録日時）列も必要とします。
-    # SQLiteでは「テーブルの形」は作成時に決まるので、古いDBをそのまま使うと
-    # 列が無くてエラーになります。
-    # そこで「表が存在する かつ seen_at列が無い」なら作り直す、という確認をしています。
-    # （本番のサービスならデータを捨てず列を足す方法を取りますが、
-    #   学習用の個人アプリでは「履歴は再取得可能」なので作り直しで十分です）
-    #
-    # PRAGMA table_info(seen) ... SQLiteに「seenテーブルの列一覧」を聞く命令
-    # 各行の2番目の要素（row[1]）が列名です。
+    # 以前のバージョンの seen テーブルは url 列しか持っていませんでした。
+    # 「seen_at列が無い古い表」が残っているなら、作り直します。
     columns = [row[1] for row in conn.execute("PRAGMA table_info(seen)").fetchall()]
     if columns and "seen_at" not in columns:
-        # DROP TABLE = 表をまるごと削除。以下の CREATE で作り直されます。
         conn.execute("DROP TABLE seen")
 
-    # テーブルを作る命令（SQL文）を実行します。
-    #
-    # 【テーブルとは】
-    #   スプレッドシートの「1枚のシート」をイメージしてください。
-    #   行（縦のデータ）と列（項目）で構成される表です。
-    #   ここでは「既読記事」専用の表を作ります。
-    #
-    # 【SQL文の意味（1行ずつ分解）】
-    #   CREATE TABLE IF NOT EXISTS seen   ... 「seen」というテーブルを
-    #                                       無ければ作る（既にあってもエラーにならない）
-    #   (
-    #     url TEXT PRIMARY KEY            ... 「url」という列を作る。
-    #                                       TEXT = 文字列の型。
-    #                                       PRIMARY KEY = この列の値は重複不可という約束。
-    #                                       これにより同じURLが2回記録されることはありません。
-    #     seen_at REAL NOT NULL           ... 「記録した日時」を入れる列。
-    #                                       REAL = 小数を含む数字の型。
-    #                                       UNIX秒（1970年1月1日からの経過秒数）で保存します。
-    #                                       NOT NULL = 必ず値を入れる制約。
-    #                                       日付を「数字」で持つと、後で
-    #                                       「◯秒より古い」といった比較が簡単にできます。
-    #   )
+    # 【テーブルの意味】
+    #   seen: 既読記事の表
+    #     url      ... 記事URL。PRIMARY KEY = 重複不可（同じURLを2回記録しない）
+    #     seen_at  ... 記録した時刻（UNIX秒）。期間切れ削除の判断に使う
     conn.execute("""
         CREATE TABLE IF NOT EXISTS seen (
             url TEXT PRIMARY KEY,
@@ -127,88 +98,144 @@ def remove_old_entries(conn: sqlite3.Connection, retention_days: int) -> int:
     """
     保持期間より古い既読記録を削除する（データベースの肥大化防止）。
 
-    引数:
-        conn: データベースのコネクション
-        retention_days: 記録を保持する日数（例: 30 なら30日前までの記録だけ残す）
-    戻り値:
-        削除した行数
-
-    【考え方】
-        「seen_at（記録時刻）が、N秒以上前レコードは消す」という理屈です。
-        cutoff（境界線）= 今の時刻 − 保持日数分の秒数
-        これより小さい seen_at = 「古い」ので削除対象。
+    戻り値: 削除した行数
     """
-    # time.time() は「今この瞬間」をUNIX秒（float）で返してくれます。
-    # UNIX秒とは「1970年1月1日0時（UTC）から数えた秒数」という世界共通の日付表現です。
-    # 数字なので、引き算や大小比較ができるのが利点です。
+    # cutoff（境界線）= 今の時刻 − 保持日数分の秒数。
+    # これより古い（小さい）seen_at の行を消します。
     cutoff = time.time() - retention_days * SECONDS_PER_DAY
-
-    # 【DELETEとは】
-    #   テーブルから行を削除する命令です。
-    #   WHERE seen_at < ? → 「seen_atが境界線より古い（＝小さい＝過去）」が条件。
     cur = conn.execute("DELETE FROM seen WHERE seen_at < ?", (cutoff,))
-
-    # cur.rowcount = このDELETEで実際に何行消えたかの数。
-    # メイン側に報告して画面表示するため、ここに戻り値として渡します。
     return cur.rowcount
 
 
 def is_seen(conn: sqlite3.Connection, url: str) -> bool:
-    """
-    このURLがすでに「既読」として記録されているか調べる。
-
-    引数:
-        conn: データベースのコネクション
-        url:  調べたい記事のURL
-    戻り値:
-        True  ... 記録済み（＝既に表示した記事）
-        False ... 未記録（＝今回が最初で最後の記事）
-
-    【SELECTとは】
-        テーブルからデータを取り出す命令です。
-        ここでは「urlがこの値の行が1行でも存在するか」を聞いています。
-    """
-    # fetchone() は検索結果の「先頭1行」を取ってきます。
-    # 該当する行が無ければ None（＝何もない）が返ります。
+    """このURLがすでに「既読」として記録されているか調べる。"""
     row = conn.execute("SELECT 1 FROM seen WHERE url = ?", (url,)).fetchone()
-
-    # row が None でなければ「見つかった＝既読」という意味です。
-    # `row is not None` という書き方で True / False を返します。
     return row is not None
 
 
 def mark_seen(conn: sqlite3.Connection, url: str) -> None:
-    """
-    このURLを「いつ既読にしたか」という日時付きでデータベースに記録する。
-
-    引数:
-        conn: データベースのコネクション
-        url:  記録したい記事のURL
-
-    【INSERTとは】
-        テーブルに新しい行を追加する命令です。
-    """
-    # INSERT OR IGNORE の "OR IGNORE" は「重複したら黙って無視してね」という意味。
-    # PRIMARY KEY の制約（重複不可）と組み合わせて、安全に記録します。
-    # VALUES (?, ?) の2つ目の ? には「今この瞬間」のUNIX秒を入れます。
-    # これにより「いつ出したか」が記録され、remove_old_entries で
-    # 「古い記録を消す」判断の基準になります。
+    """このURLを「いつ出したか」の日時付きで既読記録に追加する。"""
     conn.execute(
         "INSERT OR IGNORE INTO seen (url, seen_at) VALUES (?, ?)",
         (url, time.time()),
     )
 
 
-def save_changes(conn: sqlite3.Connection) -> None:
-    """
-    メモリ上の一時データを、ファイルに確実に書き出す。
+# =========================================================================
+# Discord に送信するための部品（関数）
+# =========================================================================
+#
+# 【Webhookの仕組み】
+#   DiscordのWebhook URLに対して、HTTPという通信のPOSTという手段で
+#   「JSON（構造化されたテキスト）」を送ると、そのチャンネルに投稿が現れます。
+#   送信データは以下のような形です:
+#
+#     {
+#       "embeds": [                       ... embed（リッチ表示の枠）のリスト
+#         {
+#           "title":  "【Gigazine】",      ... 見出し
+#           "color":  28470,               ... 枠の色（16進数の数字）
+#           "fields": [                     ... 中身の項目リスト
+#             { "name": "記事タイトル", "value": "https://..." },
+#             ...
+#           ]
+#         }
+#       ]
+#     }
+#
+#   Pythonの辞書（dict）はこの「JSON」という形式と相性が良く、
+#   requests.post(..., json=...) と渡すと自動でJSON文字列に変換してくれます。
+#
 
-    【commitとは】
-        データベースへの追加・変更は、commit（確定）するまで
-        ファイルに書き出されません。
-        commit忘れると「実行したのに記録されていない」事故になります。
+
+def build_embeds(new_articles: list) -> list:
     """
-    conn.commit()
+    新着記事リストを、Discord embed の形に変換する。
+
+    引数:
+        new_articles: [
+            {"label": "Gigazine", "title": "...", "link": "https://..."},
+            ...
+        ] のリスト
+    戻り値:
+        Discordが要求する形式の embed（辞書）のリスト
+
+    【切り分けの理屈】
+        embed 1枚には field を25個までしか入れられません。
+        そこで同じラベルの記事を25件ずつに区切り、1区切り＝1枚のembedにします。
+        2枚目以降には「続き」という名を付けて、読み手が区別できるようにします。
+    """
+    # ------------------------------------------------------------------
+    # ステップ1: ラベル（フィード名）ごとに記事をまとめる
+    # ------------------------------------------------------------------
+    # by_label は例えば次のような辞書になります:
+    # { "Gigazine": [記事..., 記事...], "ITmedia": [記事...] }
+    #
+    # setdefault(キー, 初期値) は「キーが無ければ初期値をセットして、
+    # 既にあればそのまま」。これで「ラベル → そのラベルの記事リスト」を作ります。
+    by_label = {}
+    for article in new_articles:
+        by_label.setdefault(article["label"], []).append(article)
+
+    # ------------------------------------------------------------------
+    # ステップ2: embed の形に組み立てる（25件ごとに分割）
+    # ------------------------------------------------------------------
+    embeds = []
+    for label, items in by_label.items():
+        # range(0, 長さ, 25) → 0, 25, 50, ... と25刻みの位置を進みます。
+        # items[i:i+25] は「i番目から25個のスライス（切り出し）」です。
+        for i in range(0, len(items), MAX_FIELDS_PER_EMBED):
+            chunk = items[i:i + MAX_FIELDS_PER_EMBED]
+
+            # 先頭の区切り（i==0）か、続きかの2パターンでラベルを作ります。
+            # 条件付きの値入れは「分岐が小さいならこの書き方もできる」例として使っています。
+            # （読みづらければ if/else でも全く問題ありません）
+            title = f"【{label}】" if i == 0 else f"【{label}】（続き）"
+
+            embeds.append({
+                "title": title,
+                "color": 0x00A67D,   # 16進数の色指定（緑系）。Discordの枠の色になります
+                "fields": [
+                    {
+                        # [:MAX_FIELD_NAME_LENGTH] は「先頭256文字で切る」。
+                        # RSSのタイトルは通常もっと短いですが、
+                        # 長すぎるタイトルが来てもエラーにならない保険です。
+                        "name": article["title"][:MAX_FIELD_NAME_LENGTH] or "(無題)",
+                        "value": article["link"],
+                    }
+                    for article in chunk
+                ],
+            })
+
+    return embeds
+
+
+def send_to_discord(webhook_url: str, embeds: list) -> None:
+    """
+    embedのリストをDiscord Webhookへ送信する。
+
+    【HTTP POSTとは】
+        Webサーバーに「データを送り付けて処理させる」通信の方法です。
+        GET（取りに行く）と違って、POSTは「これを受理して」と送る側が主体です。
+
+    【戻り値のステータスコード】
+        サーバーは処理結果を数字で教えてくれます。
+        2xx = 成功、4xx/5xx = エラー。
+        Webhookの成功時は 204 No Content（「受理したよ、中身は無い」）が返ります。
+    """
+    # embedは1メッセージにつき10枚まで。11枚以上ある場合は複数メッセージに分けます。
+    for i in range(0, len(embeds), MAX_EMBEDS_PER_MESSAGE):
+        payload = {"embeds": embeds[i:i + MAX_EMBEDS_PER_MESSAGE]}
+
+        # requests.post(url, json=...) がPOST送信本体です。
+        # json= を渡すと辞書をJSONに変換して送り、「Content-Type: application/json」も自動で付きます。
+        # timeout=20 は「20秒応答がなければエラー」という安全装置（無限待ち受け防止）。
+        resp = requests.post(webhook_url, json=payload, timeout=20)
+
+        # raise_for_status() は、ステータスが4xx/5xxなら例外（HTTPError）を起こします。
+        # 「失敗したのに成功と勘違いする」事故を防ぐお約束の一行です。
+        # 例外が起きればこの関数はそこで停止し、main側で「送信失敗」の処理に進みます。
+        resp.raise_for_status()
 
 
 # =========================================================================
@@ -221,35 +248,32 @@ def main():
     このプログラムのメイン処理。
     1. 設定ファイルを読み込む
     2. データベースを開き、期間切れの既読記録を削除する
-    3. 各フィードから「未読の記事だけ」を取り出して表示し、既読として記録する
-    4. 変更を確定してデータベースを閉じる
+    3. 各フィードから「未読の記事だけ」を取り出して表示する（まだ既読化しない）
+    4. 新着をDiscordへ送信する
+    5. 送信できた（or送信不要で表示まで完了した）記事だけを既読記録する
     """
 
     # ---------------------------------------------------------------------
     # 1. 設定ファイルを読み込む
     # ---------------------------------------------------------------------
 
-    # open() はファイルを開くPythonの標準関数です
-    # "r" = 読み込みモード、encoding="utf-8" = 日本語が壊れないようにする
     with open("config.yaml", "r", encoding="utf-8") as f:
-        # yaml.safe_load() はYAMLファイルを辞書（dict）に変換してくれます
         config = yaml.safe_load(f)
 
     # config は以下のような辞書になっています:
     # {
     #     "retention_days": 30,
-    #     "feeds": [
-    #         {"label": "Gigazine", "url": "https://..."},
-    #         ...
-    #     ]
+    #     "discord": {"webhook_url": "https://discord.com/api/webhooks/..."},
+    #     "feeds": [{"label": "Gigazine", "url": "https://..."}, ...]
     # }
     feeds = config["feeds"]
-
-    # dict.get("キー", 既定値) は「キーが無ければ既定値を使う」取り出し方です。
-    # config.yaml に retention_days を書かなかった場合でも動くように、
-    # 30日をデフォルトにしておきます。
-    # int(...) は「文字列の"30"を整数の30にする」変換です。
     retention_days = int(config.get("retention_days", 30))
+
+    # webhook_url の取り出し。
+    # config.get("discord") が無い場合は None になる可能性があるので
+    # `or {}` で「無いなら空辞書」という形に正規化してから中身を取ります。
+    # .strip() は文字列の前後の空白（コピペ時に紛れみやすい）を取ります。
+    webhook_url = ((config.get("discord") or {}).get("webhook_url") or "").strip()
 
     # ---------------------------------------------------------------------
     # 2. データベースを開き、古い既読記録を掃除する
@@ -257,9 +281,6 @@ def main():
 
     db_path = "seen.db"
     conn = open_db(db_path)
-
-    # 保持期間より古い記録を削除します。
-    # 毎回の起動時にやるのがポイント（放置すると無限に貯まり続けます）。
     deleted = remove_old_entries(conn, retention_days)
 
     # ---------------------------------------------------------------------
@@ -267,17 +288,22 @@ def main():
     # ---------------------------------------------------------------------
 
     print("=" * 60)
-    print("  RSSリーダー（既読管理つき）")
+    print("  RSSリーダー（既読管理 + Discord配信）")
     print("=" * 60)
     print()
     print(f"読み込むフィード数: {len(feeds)}件")
     print(f"既読データベース: {db_path}")
     print(f"既読の保持期間: {retention_days}日間")
     print(f"期間切れの削除: {deleted}件")
+    print(f"Discord配信: {'設定済み' if webhook_url else '未設定（コンソール表示のみ）'}")
     print("-" * 60)
     print()
 
-    # 今回表示する「新着記事」の合計数を数える変数
+    # 今回新着として扱った記事（Discordに送る元データ）を入れるリスト。
+    # 「送信してから既読記録」をしたいので、記録は後回しにします。
+    new_articles = []
+
+    # 表示する新着記事の数を数える変数
     total_new = 0
 
     # feeds の中身を1つずつ取り出して処理します
@@ -285,39 +311,36 @@ def main():
         label = feed["label"]
         url = feed["url"]
 
-        # --- 1つのフィードを取得 ---
-        # feedparser.parse() にURLを渡すと、自動的にHTTPリクエストを送って
-        # XMLを解析し、Pythonで扱いやすいデータ構造に変換してくれます
+        # 1つのフィードを取得（feedparserがHTTP取得とXML解析を一緒にやってくれます）
         parsed = feedparser.parse(url)
 
         print(f"【{label}】")
 
-        # そのフィードからの「取得総数」と「新着数」を分けて数えます
         fetched = len(parsed.entries)
         new_count = 0
 
-        # --- 各記事を1件ずつチェック ---
+        # 各記事を1件ずつチェック
         for entry in parsed.entries:
             title = entry.get("title", "タイトルなし")
             link = entry.get("link", "")
 
-            # URLが空の記事はスキップ（既読管理のキーが作れないため）
+            # URLが空の記事はスキップ（既読管理のキーも出典リンクも作れないため）
             if not link:
                 continue
 
-            # ここが中心部分です:
-            # 「すでに既読なら表示をスキップする」
+            # すでに既読なら表示をスキップする
             if is_seen(conn, link):
                 continue
 
-            # --- 新着記事だけを画面に表示 ---
+            # --- 新着記事として表示 & 送信リストに追加（まだ既読化しない） ---
             new_count += 1
+            total_new += 1
             print(f"  {new_count}. {title}")
             print(f"     {link}")
             print()
 
-            # 表示した記事は「もう出した」と記録する
-            mark_seen(conn, link)
+            # 送信まで完了したら既読化する分として保持しておく
+            new_articles.append({"label": label, "title": title, "link": link})
 
         # --- このフィードの集計を表示 ---
         skipped = fetched - new_count
@@ -326,22 +349,53 @@ def main():
         print("-" * 60)
         print()
 
-        # 全体の合計に加算
-        total_new += new_count
+    # ---------------------------------------------------------------------
+    # 4. Discordへ送信する
+    # ---------------------------------------------------------------------
+
+    # 「記事を既読化して良いか」のフラグです。
+    # 送信成功、または送信不要（URL未設定・新着ゼロ）なら True になります。
+    can_mark_read = False
+
+    if not webhook_url:
+        # 未設定は「エラー」ではなく「コンソール表示モード」という仕様です。
+        # 表示まで済んだので既読化して問題ありません。
+        print("Discord の webhook_url が未設定のため、送信はスキップしました。")
+        can_mark_read = True
+    elif total_new == 0:
+        print("送信する新着がありませんでした。")
+        can_mark_read = True
+    else:
+        try:
+            # embedを組み、WebhookへPOSTします。
+            embeds = build_embeds(new_articles)
+            send_to_discord(webhook_url, embeds)
+            print(f"Discordへ {total_new}件の新着を送信しました。")
+            can_mark_read = True
+        except requests.RequestException as e:
+            # ネットワーク障害・URL切れ・Discord側のエラーなど、
+            # requestsで起きる失敗は全部この例外になります。
+            # 送信できなかった以上、既読化して記事を失うわけにはいきません。
+            print(f"Discord送信に失敗したため、既読記録は更新しませんでした: {e}")
+            print("→ 次の実行で同じ記事が再送候補になります。")
 
     # ---------------------------------------------------------------------
-    # 4. 合計を表示し、データベースを確実に保存して閉じる
+    # 5. 送信できた記事だけを既読記録し、データベースを閉じる
     # ---------------------------------------------------------------------
+
+    if can_mark_read:
+        for article in new_articles:
+            mark_seen(conn, article["link"])
+
+    # メモリ上のデータをファイルに書き出します（commit忘れると記録が消える）
+    conn.commit()
+
+    # データベースの回線を閉じます。開いたものは必ず閉じるのがお作法です。
+    conn.close()
 
     print("=" * 60)
     print(f"今回の新着記事は合計 {total_new}件でした")
     print("=" * 60)
-
-    # メモリ上のデータをファイルに書き出します（commit忘れると記録が消える）
-    save_changes(conn)
-
-    # データベースの回線を閉じます。開いたものは必ず閉じるのがお作法です。
-    conn.close()
 
 
 # --- プログラムのエントリポイント ---

@@ -3,3 +3,6 @@ feedparser>=6.0
 
 # YAML形式の設定ファイルを読み込むためのライブラリ
 PyYAML>=6.0
+
+# HTTPリクエスト（Webへの送信）を行うためのライブラリ
+requests>=2.31
